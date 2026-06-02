@@ -156,13 +156,35 @@ type basicFrame struct {
 }
 
 func callstack(skip, limit int) []basicFrame {
-	// $callstack in prelude.js returns an iterator function.
-	// The returned stack reader may be able to return more than limit number
-	// of frames so only read as many as needed.
-	// skip+1 skips callstack's own call frame.
-	lines := js.Global.Call("$callstack", skip+1, limit)
+	if limit <= 0 {
+		return []basicFrame{}
+	}
+
+	skip = skip + 2 // skip callstack's own frame and $callstack's frame
+	lines := js.Global.Call("$callstack", skip, limit)
+	return parseCallstack(lines, limit)
+}
+
+var (
+	// These functions are GopherJS-specific and don't have counterparts in
+	// upstream Go runtime. To improve interoperability, we filter them out from
+	// the stack trace.
+	hiddenFrames = map[string]bool{
+		"$callDeferred": true,
+	}
+	// The following GopherJS prelude functions have differently-named
+	// counterparts in the upstream Go runtime. Some standard library code relies
+	// on the names matching, so we perform this substitution.
+	knownFrames = map[string]string{
+		"$panic":     "runtime.gopanic",
+		"$goroutine": "runtime.goexit",
+	}
+)
+
+func parseCallstack(lines *js.Object, limit int) []basicFrame {
+	// Parse all the frames skipping frames as needed.
 	frames := []basicFrame{}
-	l := min(lines.Length(), limit)
+	l := lines.Length()
 	for i := 0; i < l; i++ {
 		frame := js.Global.Call("$parseCallFrame", lines.Index(i))
 		funcName := frame.Index(0).String()
@@ -181,25 +203,12 @@ func callstack(skip, limit int) []basicFrame {
 		if funcName == "runtime.goexit" {
 			break // We've reached the bottom of the goroutine stack.
 		}
+		if len(frames) >= limit {
+			break // We've reached the requested limit.
+		}
 	}
 	return frames
 }
-
-var (
-	// These functions are GopherJS-specific and don't have counterparts in
-	// upstream Go runtime. To improve interoperability, we filter them out from
-	// the stack trace.
-	hiddenFrames = map[string]bool{
-		"$callDeferred": true,
-	}
-	// The following GopherJS prelude functions have differently-named
-	// counterparts in the upstream Go runtime. Some standard library code relies
-	// on the names matching, so we perform this substitution.
-	knownFrames = map[string]string{
-		"$panic":     "runtime.gopanic",
-		"$goroutine": "runtime.goexit",
-	}
-)
 
 func Caller(skip int) (pc uintptr, file string, line int, ok bool) {
 	skip = skip + 1 /*skip Caller's own frame*/

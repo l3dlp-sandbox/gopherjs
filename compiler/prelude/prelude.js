@@ -92,69 +92,35 @@ var $println = console.log
 // $callstack captures a stack trace and returns a list of lines, typically
 // there will be "limit" numbers of lines returned.
 // skip=0 means "the direct caller of $callstack"; limit caps frames captured.
-var $callstack = (() => {
-    // lineOffset will find the offset for a number of lines into the given string.
-    const lineOffset = (str, count) => {
-        var pos = 0;
-        for (var i = 0; i < count && pos < str.length; i++) {
-            const nl = str.indexOf("\n", pos);
-            if (nl === -1) return str.length;
-            pos = nl + 1;
-        }
-        return pos;
-    };
-
-    const prepareLines = (stack, skip) => {
-        // If `new Error().stack` doesn't exist like on older IE versions
-        // or something went wrong getting the stack, just return empty.
-        if (!stack) return [];
-        // Drop any tailing "\n" (and any trailing space before first "at " if there is one).
-        stack = stack.trim();
-        // V8 prepends an "Error" or "Error: msg" header line that isn't a frame.
-        // Firefox and Safari do not. Detect by checking for "@" or starts with "at ".
-        // This check could still be wrong if the Error message itself has an "@" in it,
-        // (e.g. `new Error("a@b")`), however since we are calling `new Error().stack`
-        // it should be fine.
-        const firstNl = stack.indexOf("\n");
-        const firstLine = firstNl === -1 ? stack : stack.substring(0, firstNl);
-        if (!firstLine.includes("@") && !firstLine.startsWith("at ")) {
-            skip++; // skip "Error" header line.
-        }
-        const start = lineOffset(stack, skip);
-        stack = stack.substring(start);
-        return stack === "" ? [] : stack.split("\n");
-    };
-
-    if (typeof Error.captureStackTrace === "function") {
-        return function $callstack(skip, limit) {
-            const oldLimit = Error.stackTraceLimit;
-            var target = {};
-            try {
-                Error.stackTraceLimit = skip + limit;
-                Error.captureStackTrace(target, $callstack);
-            } finally {
-                Error.stackTraceLimit = oldLimit;
-            }
-            const stack = target.stack;
-            // skip: captureStackTrace excludes its own frame and above.
-            return prepareLines(stack, skip);
-        };
+var $callstack = (skip, limit) => {
+    const oldLimit = Error.stackTraceLimit;
+    var stack;
+    try {
+        Error.stackTraceLimit = skip+limit
+        stack = new Error().stack
+    } finally {
+		Error.stackTraceLimit = oldLimit;
     }
 
-    return function $callstack(skip, limit) {
-        const oldLimit = Error.stackTraceLimit;
-        var stack;
-        try {
-            // limit: +1 for $callstack's own frame.
-            Error.stackTraceLimit = skip + limit + 1;
-            stack = new Error().stack;
-        } finally {
-            Error.stackTraceLimit = oldLimit;
-        }
-        // skip: +1 for $callstack's own frame.
-        return prepareLines(stack, skip + 1);
-    };
-})();
+    // If `new Error().stack` doesn't exist like on older IE versions
+    // or something went wrong getting the stack, just return empty.
+    if (!stack) return [];
+    // Drop any tailing "\n" (and any trailing space before first "at " if there is one).
+    stack = stack.trim();
+    // V8 prepends an "Error" or "Error: msg" header line that isn't a frame.
+    // Firefox and Safari do not. Detect by checking for "@" or starts with "at ".
+    // This check could still be wrong if the Error message itself has an "@" in it,
+    // (e.g. `new Error("a@b")`), however since we are calling `new Error().stack`
+    // it should be fine.
+    const firstNl = stack.indexOf("\n");
+    const firstLine = firstNl >= 0 ? stack.substring(0, firstNl) : stack;
+    if (!firstLine.includes("@") && !firstLine.startsWith("at ")) {
+        skip++; // skip "Error" header line.
+    }
+    
+	// Remove the skipped amount of the stack and the error header if there was one.
+	return stack.split("\n").slice(skip);
+}
 
 // $parseCallFrame parses a call frame string and
 // returns the tuple [funcName, file, line, col].
@@ -163,14 +129,14 @@ var $parseCallFrame = (frame) => {
     // then reuse it for all following calls.
     const posRe = /^(.+?)(?::(\d+)(?::(\d+))?)?$/;
     const parsePos = (fnName, framePos) => {
-        var file = "", line = 0, col = 0;
         const m = posRe.exec(framePos);
         if (m) {
-            file = m[1] || "";
-            line = parseInt(m[2], 10) || 0;
-            col  = parseInt(m[3], 10) || 0;
+            const file = m[1] || "";
+            const line = m[2] || 0; // Will be read with a js.Object:Int
+            const col  = m[3] || 0; // Will be read with a js.Object:Int
+            return [fnName, file, line, col];
         }
-        return [fnName, file, line, col];
+        return [fnName, "", 0, 0];
     }
     $parseCallFrame = (frame) => {
         // FireFox
@@ -200,7 +166,12 @@ var $parseCallFrame = (frame) => {
 
         var closeIdx = frame.indexOf(")", openIdx);
         if (closeIdx === -1) closeIdx = frame.length;
-        return parsePos(fnName, frame.substring(openIdx + 1, closeIdx));
+
+        var pos = frame.substring(openIdx + 1, closeIdx);
+        if (pos === "<anonymous>") {
+            return [fnName, "<anonymous>", 0, 0]
+        }
+        return parsePos(fnName, pos);
     };
     return $parseCallFrame(frame);
 };
