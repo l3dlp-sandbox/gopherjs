@@ -931,6 +931,18 @@ func (s *Session) GoRelease() string {
 	return compiler.GoRelease(s.xctx.Env().GOROOT)
 }
 
+// TestBinary returns the testBinary value that is normally passed into
+// cmd/link by a -X option. The testBinary value is defined in the STL at
+// testing/testing.go for the `testing.Testing() bool` function.
+// It is set to "1" if the binary (the JS output in our case) is built
+// with "go test" and "0" otherwise.
+func (s *Session) TestBinary() string {
+	if s.options.TestedPackage != `` {
+		return `1`
+	}
+	return `0`
+}
+
 // BuildFiles passed to the GopherJS tool as if they were a package.
 //
 // A ephemeral package will be created with only the provided files. This
@@ -1400,7 +1412,7 @@ func (s *Session) WriteCommandPackage(archive *compiler.Archive, pkgObj string) 
 	if err != nil {
 		return err
 	}
-	return compiler.WriteProgramCode(deps, sourceMapFilter, s.GoRelease())
+	return compiler.WriteProgramCode(deps, sourceMapFilter, s.GoRelease(), s.TestBinary())
 }
 
 // WaitForChange watches file system events and returns if either when one of

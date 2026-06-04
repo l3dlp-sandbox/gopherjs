@@ -35,8 +35,6 @@ jobs:
         run: cp -r ${{ env.GOPHERJS_PATH }}/.github .
       - name: Setup GopherJS
         uses: ./.github/actions/setup-gopherjs/
-        with:
-          includeSyscall: 'true'
       - name: Test GopherJS
         working-directory: ${{ env.GOPHERJS_PATH }}
         run: go test -v -short ./...
@@ -131,8 +129,6 @@ jobs:
         run: cp -r ${{ env.GOPHERJS_PATH }}/.github .
       - name: Setup GopherJS
         uses: ./.github/actions/setup-gopherjs/
-        with:
-          includeSyscall: 'true'
       - name: Run Tests
         working-directory: ${{ env.GOPHERJS_PATH }}
         # Run all tests except gorepo tests.
@@ -183,7 +179,7 @@ jobs:
   gopherjs_tests:
     name: GopherJS Tests (${{ matrix.filter.name }})
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
