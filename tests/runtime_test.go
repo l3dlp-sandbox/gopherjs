@@ -118,6 +118,26 @@ func Test_parseCallFrame(t *testing.T) {
 			input: "at https://example.com/angular.min.js:31:225",
 			want:  callFrame{FuncName: "<none>", File: "https://example.com/angular.min.js", Line: 31, Col: 225},
 		},
+		{
+			name:  "Node.js 24+ (V8) receiver prefix for package-level function",
+			input: "at Object.runtime.Callers (runtime.go:42:3)",
+			want:  callFrame{FuncName: "runtime.Callers", File: "runtime.go", Line: 42, Col: 3},
+		},
+		{
+			name:  "Node.js 24+ (V8) receiver prefix for function on type",
+			input: "at typ2.github.com/gopherjs/gopherjs/tests.callStack.capture (runtime.go:42:3)",
+			want:  callFrame{FuncName: "github.com/gopherjs/gopherjs/tests.callStack.capture", File: "runtime.go", Line: 42, Col: 3},
+		},
+		{
+			name:  "Node.js 24+ (V8) receiver prefix for function on type",
+			input: "at typ2.tests.callStack.capture (runtime.go:42:3)",
+			want:  callFrame{FuncName: "tests.callStack.capture", File: "runtime.go", Line: 42, Col: 3},
+		},
+		{
+			name:  "Node.js 24+ (V8) receiver prefix for function on type when minified",
+			input: "at r.github.com/gopherjs/gopherjs/tests.callStack.capture (runtime.go:42:3)",
+			want:  callFrame{FuncName: "github.com/gopherjs/gopherjs/tests.callStack.capture", File: "runtime.go", Line: 42, Col: 3},
+		},
 	}
 
 	for _, tt := range tests {
@@ -169,8 +189,8 @@ func (c *callStack) capture(amount int) {
 func TestCallers(t *testing.T) {
 	// Some of the GopherJS function names don't match upstream Go, or even the
 	// function names in the Go source when minified.
-	// Until https://github.com/gopherjs/gopherjs/issues/1085 is resolved, the
-	// mismatch is difficult to avoid, but we can at least use "masked" frames to
+	// In some cases the mismatch is difficult to avoid even with source maps,
+	// but we can at least use "masked" frames to
 	// make sure the number of frames matches expected.
 	opts := cmp.Comparer(func(a, b funcName) bool {
 		if a == masked("") || b == masked("") {
