@@ -65,12 +65,35 @@ func (e *TypeAssertionError) Error() string {
 		": missing method " + e.missingMethod
 }
 
+// A PanicNilError happens when code calls panic(nil).
+//
+// Before Go 1.21, programs that called panic(nil) observed recover returning nil.
+// Starting in Go 1.21, programs that call panic(nil) observe recover returning a *PanicNilError.
+// Programs can change back to the old behavior by setting GODEBUG=panicnil=1.
+type PanicNilError struct {
+	// This field makes PanicNilError structurally different from
+	// any other struct in this package, and the _ makes it different
+	// from any struct in other packages too.
+	// This avoids any accidental conversions being possible
+	// between this struct and some other struct sharing the same fields,
+	// like happened in go.dev/issue/56603.
+	_ [0]*PanicNilError
+}
+
+func (*PanicNilError) Error() string { return "panic called with nil argument" }
+func (*PanicNilError) RuntimeError() {}
+
+func newPanicNilError() *PanicNilError { return new(PanicNilError) }
+
 func init() {
 	jsPkg := js.Global.Get("$packages").Get("github.com/gopherjs/gopherjs/js")
 	js.Global.Set("$jsObjectPtr", jsPkg.Get("Object").Get("ptr"))
 	js.Global.Set("$jsErrorPtr", jsPkg.Get("Error").Get("ptr"))
 	js.Global.Set("$throwRuntimeError", js.InternalObject(throw))
+	js.Global.Set("$newPanicNilError", js.InternalObject(newPanicNilError))
 	buildVersion = js.Global.Get("$goVersion").String()
+	// Prepare the prelude's $panicnil flag from GODEBUG at startup.
+	syncPanicNilFromGodebug(getEnvString(godebugEnvKey))
 	// avoid dead code elimination
 	var e error
 	e = &TypeAssertionError{}
@@ -102,31 +125,28 @@ var (
 	//
 	// We use the map and the slice below to convert a "file:line" position
 	// into an integer position counter and then to a Func instance.
-	knownPositions   = map[string]uintptr{}
-	positionCounters = []*Func{}
+	//
+	// Index 0 is reserved as the "unknown PC": upstream Go documents
+	// PC=0 as "no caller available" (see e.g. log/slog.Record.PC), and packages
+	// using PCs, initialize a uintptr to zero and expect runtime.CallersFrames
+	// and runtime.FuncForPC to treat it as unknown.
+	knownPositions   = map[basicFrame]uintptr{}
+	positionCounters = []*Func{nil}
 )
 
-func registerPosition(funcName string, file string, line int, col int) uintptr {
-	key := file + ":" + itoa(line) + ":" + itoa(col)
-	if pc, found := knownPositions[key]; found {
+func registerPosition(frame basicFrame) uintptr {
+	if pc, found := knownPositions[frame]; found {
 		return pc
 	}
 	f := &Func{
-		name: funcName,
-		file: file,
-		line: line,
+		name: frame.FuncName,
+		file: frame.File,
+		line: frame.Line,
 	}
 	pc := uintptr(len(positionCounters))
 	positionCounters = append(positionCounters, f)
-	knownPositions[key] = pc
+	knownPositions[frame] = pc
 	return pc
-}
-
-// itoa converts an integer to a string.
-//
-// Can't use strconv.Itoa() in the `runtime` package due to a cyclic dependency.
-func itoa(i int) string {
-	return js.Global.Get("String").New(i).String()
 }
 
 // basicFrame contains stack trace information extracted from JS stack trace.
@@ -138,9 +158,13 @@ type basicFrame struct {
 }
 
 func callstack(skip, limit int) []basicFrame {
-	skip = skip + 1 /*skip error message*/ + 1 /*skip callstack's own frame*/
-	lines := js.Global.Get("Error").New().Get("stack").Call("split", "\n").Call("slice", skip, skip+limit)
-	return parseCallstack(lines)
+	if limit <= 0 {
+		return []basicFrame{}
+	}
+
+	skip = skip + 2 // skip callstack's own frame and $callstack's frame
+	lines := js.Global.Call("$callstack", skip, limit)
+	return parseCallstack(lines, limit)
 }
 
 var (
@@ -159,80 +183,33 @@ var (
 	}
 )
 
-func parseCallstack(lines *js.Object) []basicFrame {
+func parseCallstack(lines *js.Object, limit int) []basicFrame {
+	// Parse all the frames skipping frames as needed.
 	frames := []basicFrame{}
 	l := lines.Length()
 	for i := 0; i < l; i++ {
-		frame := ParseCallFrame(lines.Index(i))
-		if hiddenFrames[frame.FuncName] {
+		frame := js.Global.Call("$parseCallFrame", lines.Index(i))
+		funcName := frame.Index(0).String()
+		if hiddenFrames[funcName] {
 			continue
 		}
-		if alias, ok := knownFrames[frame.FuncName]; ok {
-			frame.FuncName = alias
+		if alias, ok := knownFrames[funcName]; ok {
+			funcName = alias
 		}
-		frames = append(frames, frame)
-		if frame.FuncName == "runtime.goexit" {
+		frames = append(frames, basicFrame{
+			FuncName: funcName,
+			File:     frame.Index(1).String(),
+			Line:     frame.Index(2).Int(),
+			Col:      frame.Index(3).Int(),
+		})
+		if funcName == "runtime.goexit" {
 			break // We've reached the bottom of the goroutine stack.
+		}
+		if len(frames) >= limit {
+			break // We've reached the requested limit.
 		}
 	}
 	return frames
-}
-
-// ParseCallFrame is exported for the sake of testing. See this discussion for context https://github.com/gopherjs/gopherjs/pull/1097/files/561e6381406f04ccb8e04ef4effedc5c7887b70f#r776063799
-//
-// TLDR; never use this function!
-func ParseCallFrame(info *js.Object) basicFrame {
-	// FireFox
-	if info.Call("indexOf", "@").Int() >= 0 {
-		split := js.Global.Get("RegExp").New("[@:]")
-		parts := info.Call("split", split)
-		return basicFrame{
-			File:     parts.Call("slice", 1, parts.Length()-2).Call("join", ":").String(),
-			Line:     parts.Index(parts.Length() - 2).Int(),
-			Col:      parts.Index(parts.Length() - 1).Int(),
-			FuncName: parts.Index(0).String(),
-		}
-	}
-
-	// Chrome / Node.js
-	openIdx := info.Call("lastIndexOf", "(").Int()
-	if openIdx == -1 {
-		parts := info.Call("split", ":")
-
-		return basicFrame{
-			File: parts.Call("slice", 0, parts.Length()-2).Call("join", ":").
-				Call("replace", js.Global.Get("RegExp").New(`^\s*at `), "").String(),
-			Line:     parts.Index(parts.Length() - 2).Int(),
-			Col:      parts.Index(parts.Length() - 1).Int(),
-			FuncName: "<none>",
-		}
-	}
-
-	var file, funcName string
-	var line, col int
-
-	pos := info.Call("substring", openIdx+1, info.Call("indexOf", ")").Int())
-	parts := pos.Call("split", ":")
-
-	if pos.String() == "<anonymous>" {
-		file = "<anonymous>"
-	} else {
-		file = parts.Call("slice", 0, parts.Length()-2).Call("join", ":").String()
-		line = parts.Index(parts.Length() - 2).Int()
-		col = parts.Index(parts.Length() - 1).Int()
-	}
-	fn := info.Call("substring", info.Call("indexOf", "at ").Int()+3, info.Call("indexOf", " (").Int())
-	if idx := fn.Call("indexOf", "[as ").Int(); idx > 0 {
-		fn = fn.Call("substring", idx+4, fn.Call("indexOf", "]"))
-	}
-	funcName = fn.String()
-
-	return basicFrame{
-		File:     file,
-		Line:     line,
-		Col:      col,
-		FuncName: funcName,
-	}
 }
 
 func Caller(skip int) (pc uintptr, file string, line int, ok bool) {
@@ -241,8 +218,9 @@ func Caller(skip int) (pc uintptr, file string, line int, ok bool) {
 	if len(frames) != 1 {
 		return 0, "", 0, false
 	}
-	pc = registerPosition(frames[0].FuncName, frames[0].File, frames[0].Line, frames[0].Col)
-	return pc, frames[0].File, frames[0].Line, true
+	frame := frames[0]
+	pc = registerPosition(frame)
+	return pc, frame.File, frame.Line, true
 }
 
 // Callers fills the slice pc with the return program counters of function
@@ -265,15 +243,31 @@ func Caller(skip int) (pc uintptr, file string, line int, ok bool) {
 func Callers(skip int, pc []uintptr) int {
 	frames := callstack(skip, len(pc))
 	for i, frame := range frames {
-		pc[i] = registerPosition(frame.FuncName, frame.File, frame.Line, frame.Col)
+		pc[i] = registerPosition(frame)
 	}
 	return len(frames)
 }
 
+// CallersFrames takes a slice of PC values returned by Callers and prepares to
+// return function/file/line information. Done is true when no more frames are
+// available.
+//
+// GopherJS notes:
+//   - PCs that didn't come from Caller/Callers (e.g. a function pointer obtained
+//     via reflect.ValueOf(fn).Pointer()) are not in our positionCounters.
+//     For those, FuncForPC returns nil and we emit a Frame with the original PC
+//     and empty symbol fields, like Go will.
+//   - GopherJS's internal frames such as $callDeferred and $goroutine were
+//     already filtered (or aliased) by callstack at capture time, so anything
+//     reaching CallersFrames is either a real Go frame or a PC we can't resolve.
 func CallersFrames(callers []uintptr) *Frames {
 	result := Frames{}
 	for _, pc := range callers {
 		fun := FuncForPC(pc)
+		if fun == nil {
+			result.frames = append(result.frames, Frame{PC: pc})
+			continue
+		}
 		result.frames = append(result.frames, Frame{
 			PC:       pc,
 			Func:     fun,
@@ -416,13 +410,23 @@ func (f *Func) Name() string {
 
 func FuncForPC(pc uintptr) *Func {
 	ipc := int(pc)
-	if ipc >= len(positionCounters) {
+	if ipc <= 0 || ipc >= len(positionCounters) {
 		// Since we are faking position counters, the only valid way to obtain one
 		// is through a Caller() or Callers() function. If pc is out of positionCounters
 		// bounds it must have been obtained in some other way, which is unexpected.
-		// If a panic proves problematic, we can return a nil *Func, which will
-		// present itself as a generic "unknown" function.
-		panic("GopherJS: pc=" + itoa(ipc) + " is out of range of known position counters")
+		// FuncForPC in Go returns nil for a PC that does not correspond to a
+		// known function. so returning nil for PCs we cannot resolvable, even if
+		// Go could resolve it, lets the callers keep working with empty symbols.
+		// For example:
+		//   - log/slog passes PC=0 through CallersFrames when a Record was
+		//     created without a real caller (record.go's PC field)
+		//   - test/fixedbugs/issue29735.go deliberately walks past the
+		//     end of a function looking for the next. This will cause it to
+		//     not succeed at what it is trying to do but will allow the test to pass.
+		//   - test/fixedbugs/issue58300.go and test/fixedbugs/issue58300b.go give
+		//     FuncForPC a function pointer from `reflect.ValueOf(fn).Pointer()`,
+		//     which is not produced by Caller/Callers and so isn't in our table.
+		return nil
 	}
 	return positionCounters[ipc]
 }
@@ -501,6 +505,13 @@ func godebug_setUpdate(update func(def, env string)) {
 	godebug_notify(godebugEnvKey, godebugEnv)
 }
 
+// godebug_setNewIncNonDefault implements the setNewIncNonDefault in
+// src/internal/godebug/godebug.go.
+// GOPHERJS: The GopherJS runtime doesn't need this function so we can remove it.
+//
+//gopherjs:purge
+func godebug_setNewIncNonDefault(newIncNonDefault func(string) func())
+
 func getEnvString(key string) string {
 	process := js.Global.Get(`process`)
 	if process == js.Undefined {
@@ -521,13 +532,39 @@ func getEnvString(key string) string {
 }
 
 // godebug_notify is the function is called by syscall anytime an environment
-// variable is set or unset. It emit the GODEBUG setting if it was changed.
+// variable is set or unset. It emits the GODEBUG setting if it was changed.
 func godebug_notify(key, value string) {
-	update := godebugUpdate
-	if update == nil || key != godebugEnvKey {
+	if key != godebugEnvKey {
 		return
 	}
 
-	godebugDefault := ``
-	update(godebugDefault, value)
+	if update := godebugUpdate; update != nil {
+		godebugDefault := ``
+		update(godebugDefault, value)
+	}
+
+	// Keep the prelude's $panicnil flag in sync with GODEBUG even when the
+	// program never imported internal/godebug in which case `update` is nil.
+	syncPanicNilFromGodebug(value)
+}
+
+// syncPanicNilFromGodebug parses the given GODEBUG value for `panicnil=N`
+// and writes the result into the prelude's `$panicnil` value.
+// $panicnil mirrors the runtime's `debug.panicnil` GODEBUG setting.
+// When set to "1" (i.e. `GODEBUG=panicnil=1`), `panic(nil)` keeps the pre-go1.21
+// behavior of being recoverable as a real `nil`.
+// When "0" (the go1.21+ default), `panic(nil)` is wrapped into a
+// `*runtime.PanicNilError` so `recover()` returns a non-nil error.
+func syncPanicNilFromGodebug(godebug string) {
+	panicnil := `0`
+	if godebug != `` {
+		// Parse on the JS side to avoid pulling `strings` into the runtime package.
+		// The regex matches `panicnil=<digit>` in the comma-separated GODEBUG value.
+		re := js.Global.Get(`RegExp`).New(`(?:^|,)panicnil=(\d+)(?:,|$)`)
+		m := re.Call(`exec`, godebug)
+		if m != nil && m != js.Undefined && m.Length() >= 2 {
+			panicnil = m.Index(1).String()
+		}
+	}
+	js.Global.Set("$panicnil", panicnil)
 }

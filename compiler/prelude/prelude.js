@@ -72,6 +72,7 @@ var $packages = {}, $idCounter = 0;
 var $keys = m => { return m ? Object.keys(m) : []; };
 var $flushConsole = () => { };
 var $throwRuntimeError; /* set by package "runtime" */
+var $newPanicNilError; /* set by package "runtime" — returns a new *PanicNilError */
 var $throwNilPointerError = () => { $throwRuntimeError("invalid memory address or nil pointer dereference"); };
 var $call = (fn, rcvr, args) => { return fn.apply(rcvr, args); };
 var $makeFunc = fn => { return function(...args) { return $externalize(fn(this, new ($sliceType($jsObjectPtr))($global.Array.prototype.slice.call(args, []))), $emptyInterface); }; };
@@ -87,6 +88,104 @@ if (($global.process !== undefined) && $global.require) {
     }
 }
 var $println = console.log
+
+// $callstack captures a stack trace and returns a list of lines, typically
+// there will be "limit" numbers of lines returned.
+// skip=0 means "the direct caller of $callstack"; limit caps frames captured.
+var $callstack = (skip, limit) => {
+    const oldLimit = Error.stackTraceLimit;
+    var stack;
+    try {
+        Error.stackTraceLimit = skip+limit
+        stack = new Error().stack
+    } finally {
+		Error.stackTraceLimit = oldLimit;
+    }
+
+    // If `new Error().stack` doesn't exist like on older IE versions
+    // or something went wrong getting the stack, just return empty.
+    if (!stack) return [];
+    // Drop any tailing "\n" (and any trailing space before first "at " if there is one).
+    stack = stack.trim();
+    // V8 prepends an "Error" or "Error: msg" header line that isn't a frame.
+    // Firefox and Safari do not. Detect by checking for "@" or starts with "at ".
+    // This check could still be wrong if the Error message itself has an "@" in it,
+    // (e.g. `new Error("a@b")`), however since we are calling `new Error().stack`
+    // it should be fine.
+    const firstNl = stack.indexOf("\n");
+    const firstLine = firstNl >= 0 ? stack.substring(0, firstNl) : stack;
+    if (!firstLine.includes("@") && !firstLine.startsWith("at ")) {
+        skip++; // skip "Error" header line.
+    }
+    
+	// Remove the skipped amount of the stack and the error header if there was one.
+	return stack.split("\n").slice(skip);
+}
+
+// $parseCallFrame parses a call frame string and
+// returns the tuple [funcName, file, line, col].
+var $parseCallFrame = (frame) => {
+    // The first time this is called, compile the regexp,
+    // then reuse it for all following calls.
+    const posRe = /^(.+?)(?::(\d+)(?::(\d+))?)?$/;
+    const parsePos = (fnName, framePos) => {
+        const m = posRe.exec(framePos);
+        if (m) {
+            const file = m[1] || "";
+            const line = m[2] || 0; // Will be read with a js.Object:Int
+            const col  = m[3] || 0; // Will be read with a js.Object:Int
+            return [fnName, file, line, col];
+        }
+        return [fnName, "", 0, 0];
+    }
+
+    // Node.js 24+ (V8) includes the receiver object name in stack traces,
+    // e.g., "Object.runtime.Callers" and "typ2.github.com/...".
+    // The `typ2` comes from prelude\types.js in `$newType`, since the `typ`
+    // in that function gets renamed by esbuild to `typ2`, or it can be named
+    // anything else when minimized. To avoid false positives, the following
+    // pattern looks for specific matches, meaning we will have some false negatives.
+    const receiverRe = /^(?:(?:Object|typ\d*)\.)|(?:[a-zA-Z_$][a-zA-Z0-9_$]*\.(github\.com[\\|/]))/;
+    const stripReceiver = (fnName) => fnName.replace(receiverRe, "$1");
+
+    $parseCallFrame = (frame) => {
+        // FireFox
+        const atIdx = frame.indexOf("@")
+        if (atIdx >= 0) {
+            const fnName = frame.substring(0, atIdx) || "<none>";
+            return parsePos(fnName, frame.substring(atIdx + 1));
+        }
+
+	    // Chrome / Node.js
+        const atLeadIdx = frame.indexOf("at ");
+        if (atLeadIdx >= 0) frame = frame.substring(atLeadIdx + 3);
+        const openIdx = frame.lastIndexOf("(");
+        if (openIdx === -1) {
+            // No-parens form: "at file:line:col"
+            return parsePos("<none>", frame);
+        }
+
+        // With-parens form: "at func (file:line:col)"
+        var fnName = frame.substring(0, frame.indexOf("(")).trim();
+        const asIdx = fnName.indexOf("[as ");
+        if (asIdx > 0) {
+            var closeIdx = fnName.indexOf("]");
+            if (closeIdx === -1) closeIdx = fnName.length;
+            fnName = fnName.substring(asIdx+4, closeIdx).trim();
+        }
+        fnName = stripReceiver(fnName)
+
+        var closeIdx = frame.indexOf(")", openIdx);
+        if (closeIdx === -1) closeIdx = frame.length;
+
+        var pos = frame.substring(openIdx + 1, closeIdx);
+        if (pos === "<anonymous>") {
+            return [fnName, "<anonymous>", 0, 0]
+        }
+        return parsePos(fnName, pos);
+    };
+    return $parseCallFrame(frame);
+};
 
 var $callForAllPackages = (methodName) => {
     var names = $keys($packages);
@@ -236,7 +335,7 @@ var $convertSliceType = (slice, desiredType) => {
         return desiredType.nil; // Preserve nil value.
     }
 
-    return $subslice(new desiredType(slice.$array), slice.$offset, slice.$offset + slice.$length);
+    return $subslice(new desiredType(slice.$array), slice.$offset, slice.$offset + slice.$length, slice.$offset + slice.$capacity);
 }
 
 var $decodeRune = (str, pos) => {
@@ -408,6 +507,9 @@ var $clone = (src, type) => {
 };
 
 var $pointerOfStructConversion = (obj, type) => {
+    if (obj === (obj.constructor && obj.constructor.nil)) {
+        return type.nil;
+    }
     if (obj.$proxies === undefined) {
         obj.$proxies = {};
         obj.$proxies[obj.constructor.id] = obj;
@@ -579,7 +681,7 @@ var $unsafeMethodToFunction = (typ, name, isPtr) => {
                         r = new ptrType(r);
                         break;
                     default:
-                        r = new ptrType(r.$get, r.$set, r.$target);
+                        r = new ptrType(r.$get, r.$set, r.$target, r.$index);
                 }
             }
             return r[name](...args);
@@ -620,9 +722,80 @@ var $typeOf = x => {
     return typeof (x);
 };
 
-var $sliceData = (slice, typ) => {
-    if (slice === typ.nil) {
-        return $ptrType(typ.elem).nil;
+var $unsafeString = (ptr, len) => {
+    var byteSliceType = $sliceType($Uint8);
+    return $bytesToString($unsafeSlice(ptr, len, byteSliceType, "String"));
+};
+
+var $unsafeStringData = str => {
+    if (str.length === 0) {
+        return $ptrType($Uint8).nil;
     }
-    return $indexPtr(slice.$array, slice.$offset, typ.elem);
+    var byteSliceType = $sliceType($Uint8);
+    var b = new byteSliceType($stringToBytes(str));
+    return $unsafeSliceData(b, byteSliceType);
+};
+
+var $unsafeSlice = (ptr, len, typ, methodName = "Slice") => {
+    if (len < 0) {
+        $throwRuntimeError("unsafe."+methodName+": len out of range");
+    }
+    var ptrType = $ptrType(typ.elem);
+    if (ptr === ptrType.nil || ptr.$target === undefined) {
+        if (len > 0) {
+            $throwRuntimeError("unsafe."+methodName+": ptr is nil and len is not zero");
+        }
+        return typ.nil;
+    }
+    if (len === 0) {
+        var s = new typ(ptr.$target);
+        s.$offset = ptr.$index !== undefined ? ptr.$index : 0;
+        s.$length = 0;
+        s.$capacity = 0;
+        return s;
+    }
+    if (ptr.$index === undefined) {
+        // Go can cast a footprint of memory for some data into an array, but JS can not.
+        // If the $index is undefined then the pointer is for a struct field,
+        // a non-escaping scalar pointer, or something else, but not an array or slice.
+        $throwRuntimeError("unsafe." + methodName + ": pointer does not address a slice or array element (missing index)");
+    }
+    if (ptr.$target.buffer && ptr.$target.BYTES_PER_ELEMENT && ptr.$target.constructor !== $nativeArray(typ.elem.kind)) {
+        $throwRuntimeError("unsafe." + methodName + ": pointer does not match slice element storage layout");
+    }
+    if (ptr.$index + len > ptr.$target.length) {
+        // Go can grab abritraty footprints of memory, JS can not. Instead of trying
+        // to grow the target, which would only work for Array, just always error.
+        $throwRuntimeError("unsafe." + methodName + ": len out of range");
+    }
+    var s = new typ(ptr.$target);
+    s.$offset = ptr.$index;
+    s.$length = len;
+    s.$capacity = len;
+    return s;
+};
+
+var $unsafeSliceData = (slice, typ) => {
+    var ptrType = $ptrType(typ.elem);
+    if (slice === typ.nil) {
+        return ptrType.nil;
+    }
+    return $indexPtr(slice.$array, slice.$offset, ptrType);
+};
+
+var $clearSlice = (slice) => {
+    const n = slice.$length;
+    if (n === 0) {
+        return
+    }
+    const arr = slice.$array;
+    const off = slice.$offset;
+    const zeroFn = slice.constructor.elem.zero;
+    for (let i = 0; i < n; i++) {
+        arr[off + i] = zeroFn();
+    }
+};
+
+var $clearMap = (m) => {
+    typeof m.clear === "function" && m.clear()
 };

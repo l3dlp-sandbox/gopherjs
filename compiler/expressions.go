@@ -226,21 +226,28 @@ func (fc *funcContext) translateExpr(expr ast.Expr) *expression {
 				return fc.formatExpr("%e.object", e.X)
 			}
 
+			opIsStructOrArray := false
 			switch t.Underlying().(type) {
 			case *types.Struct, *types.Array:
 				// JavaScript's pass-by-reference semantics makes passing array's or
 				// struct's object semantically equivalent to passing a pointer
 				// TODO(nevkontakte): Evaluate if performance gain justifies complexity
 				// introduced by the special case.
-				return fc.translateExpr(e.X)
+				opIsStructOrArray = true
 			}
 
 			elemType := exprType.(*types.Pointer).Elem()
 
 			switch x := astutil.RemoveParens(e.X).(type) {
 			case *ast.CompositeLit:
+				if opIsStructOrArray {
+					return fc.translateExpr(e.X)
+				}
 				return fc.formatExpr("$newDataPointer(%e, %s)", x, fc.typeName(fc.typeOf(e)))
 			case *ast.Ident:
+				if opIsStructOrArray {
+					return fc.translateExpr(e.X)
+				}
 				obj := fc.pkgCtx.Uses[x].(*types.Var)
 				if fc.pkgCtx.escapingVars[obj] {
 					name, ok := fc.assignedObjectName(obj)
@@ -252,6 +259,9 @@ func (fc *funcContext) translateExpr(expr ast.Expr) *expression {
 				}
 				return fc.formatExpr(`(%1s || (%1s = new %2s(function() { return %3s; }, function($v) { %4s })))`, fc.varPtrName(obj), fc.typeName(exprType), fc.objectName(obj), fc.translateAssign(x, fc.newIdent("$v", elemType), false))
 			case *ast.SelectorExpr:
+				if opIsStructOrArray {
+					return fc.translateExpr(e.X)
+				}
 				sel, ok := fc.selectionOf(x)
 				if !ok {
 					// qualified identifier
@@ -261,12 +271,21 @@ func (fc *funcContext) translateExpr(expr ast.Expr) *expression {
 				newSel := &ast.SelectorExpr{X: fc.newIdent("this.$target", fc.typeOf(x.X)), Sel: x.Sel}
 				fc.setType(newSel, exprType)
 				fc.pkgCtx.additionalSelections[newSel] = sel
-				return fc.formatExpr("(%1e.$ptr_%2s || (%1e.$ptr_%2s = new %3s(function() { return %4e; }, function($v) { %5s }, %1e)))", x.X, x.Sel.Name, fc.typeName(exprType), newSel, fc.translateAssign(newSel, fc.newIdent("$v", exprType), false))
-			case *ast.IndexExpr:
-				if _, ok := fc.typeOf(x.X).Underlying().(*types.Slice); ok {
-					return fc.formatExpr("$indexPtr(%1e.$array, %1e.$offset + %2e, %3s)", x.X, x.Index, fc.typeName(exprType))
+				if _, ok := fc.typeOf(x.X).Underlying().(*types.Pointer); ok {
+					return fc.formatExpr("(%1e === %2s.nil && $throwNilPointerError(), (%1e.$ptr_%3s || (%1e.$ptr_%3s = new %4s(function() { return %5e; }, function($v) { %6s }, %1e))))",
+						x.X, fc.typeName(fc.typeOf(x.X)), x.Sel.Name, fc.typeName(exprType), newSel, fc.translateAssign(newSel, fc.newIdent("$v", exprType), false))
 				}
-				return fc.formatExpr("$indexPtr(%e, %e, %s)", x.X, x.Index, fc.typeName(exprType))
+				return fc.formatExpr("(%1e.$ptr_%2s || (%1e.$ptr_%2s = new %3s(function() { return %4e; }, function($v) { %5s }, %1e)))",
+					x.X, x.Sel.Name, fc.typeName(exprType), newSel, fc.translateAssign(newSel, fc.newIdent("$v", exprType), false))
+			case *ast.IndexExpr:
+				// To allow a slice to be recreated from a `&s[i]` via casting a pointer back into the slice or using `unsafe.Slice`,
+				// we have to create pointer objects via `$indexPtr` even if the element is a struct or array, meaning ignore the `opIsStructOrArray` case.
+				if _, ok := fc.typeOf(x.X).Underlying().(*types.Slice); ok {
+					pattern := rangeCheck("$indexPtr(%1e.$array, %1e.$offset + %2f, %3s)", fc.pkgCtx.Types[x.Index].Value != nil, false)
+					return fc.formatExpr(pattern, x.X, x.Index, fc.typeName(exprType))
+				}
+				pattern := rangeCheck("$indexPtr(%1e, %2f, %3s)", fc.pkgCtx.Types[x.Index].Value != nil, true)
+				return fc.formatExpr(pattern, x.X, x.Index, fc.typeName(exprType))
 			case *ast.StarExpr:
 				return fc.translateExpr(x.X)
 			default:
@@ -648,6 +667,12 @@ func (fc *funcContext) translateExpr(expr ast.Expr) *expression {
 						return fc.formatExpr("debugger")
 					case "InternalObject":
 						return fc.translateExpr(e.Args[0])
+					case "MakeUint64":
+						return fc.formatExpr("new $Uint64(%e, %e)", e.Args[0], e.Args[1])
+					case "Uint64High":
+						return fc.formatExpr("%e.$high", e.Args[0])
+					case "Uint64Low":
+						return fc.formatExpr("%e.$low", e.Args[0])
 					}
 				}
 				return fc.translateCall(e, sig, fc.translateExpr(f))
@@ -783,6 +808,10 @@ func (fc *funcContext) translateExpr(expr ast.Expr) *expression {
 		}
 		switch exprType.Underlying().(type) {
 		case *types.Struct, *types.Array:
+			innerTyp := fc.typeOf(e.X)
+			if _, ok := innerTyp.Underlying().(*types.Pointer); ok {
+				return fc.formatExpr("(%1e === %2s.nil && $throwNilPointerError(), %1e)", e.X, fc.typeName(innerTyp))
+			}
 			return fc.translateExpr(e.X)
 		}
 		return fc.formatExpr("%e.$get()", e.X)
@@ -1064,6 +1093,26 @@ func (fc *funcContext) translateBuiltin(name string, sig *types.Signature, args 
 		return fc.formatExpr("$recover()")
 	case "close":
 		return fc.formatExpr(`$close(%e)`, args[0])
+	case "min", "max":
+		if basic, isBasic := fc.typeOf(args[0]).Underlying().(*types.Basic); isBasic && isOrdered(basic) {
+			fnName := `$` + name
+			if is64Bit(basic) {
+				fnName += `64`
+			} else if isString(basic) {
+				fnName += `Str`
+			}
+			return fc.formatExpr("%s(%e, %s)", fnName, args[0], strings.Join(fc.translateExprSlice(args[1:], basic), `, `))
+		}
+		panic(fmt.Sprintf("Unhandled type for %s: %T\n", name, args[0]))
+	case "clear":
+		switch argType := fc.typeOf(args[0]).Underlying().(type) {
+		case *types.Slice:
+			return fc.formatExpr("$clearSlice(%e)", args[0])
+		case *types.Map:
+			return fc.formatExpr("$clearMap(%e)", args[0])
+		default:
+			panic(fmt.Sprintf("Unhandled clear type: %T\n", argType))
+		}
 	case "Sizeof":
 		return fc.formatExpr("%d", sizes32.Sizeof(fc.typeOf(args[0])))
 	case "Alignof":
@@ -1071,9 +1120,17 @@ func (fc *funcContext) translateBuiltin(name string, sig *types.Signature, args 
 	case "Offsetof":
 		sel, _ := fc.selectionOf(astutil.RemoveParens(args[0]).(*ast.SelectorExpr))
 		return fc.formatExpr("%d", typesutil.OffsetOf(sizes32, sel))
+	case "String":
+		return fc.formatExpr("$unsafeString(%e, %f)", args[0], args[1])
+	case "StringData":
+		return fc.formatExpr(`$unsafeStringData(%e)`, args[0])
+	case "Slice":
+		ptrType := fc.typeOf(args[0]).Underlying().(*types.Pointer)
+		sliceType := types.NewSlice(ptrType.Elem())
+		return fc.formatExpr("$unsafeSlice(%e, %f, %s)", args[0], args[1], fc.typeName(sliceType))
 	case "SliceData":
 		t := fc.typeOf(args[0]).Underlying().(*types.Slice)
-		return fc.formatExpr(`$sliceData(%e, %s)`, args[0], fc.typeName(t))
+		return fc.formatExpr(`$unsafeSliceData(%e, %s)`, args[0], fc.typeName(t))
 	default:
 		panic(fmt.Sprintf("Unhandled builtin: %s\n", name))
 	}
@@ -1104,22 +1161,55 @@ func (fc *funcContext) translateExprSlice(exprs []ast.Expr, desiredType types.Ty
 	return parts
 }
 
+// packageAllowsKindTypeConversion determines if the current package should
+// be checked for a special type of casts, `kindType` or `kindTypeExt` conversions.
+func (fc *funcContext) packageAllowsKindTypeConversion() bool {
+	switch fc.pkgCtx.Pkg.Path() {
+	case `internal/abi`, `internal/reflectlite`, `reflect`:
+		return true
+	}
+	return false
+}
+
 func (fc *funcContext) translateConversion(expr ast.Expr, desiredType types.Type) *expression {
 	exprType := fc.typeOf(expr)
 	if types.Identical(exprType, desiredType) {
 		return fc.translateExpr(expr)
 	}
 
-	if fc.pkgCtx.Pkg.Path() == "reflect" || fc.pkgCtx.Pkg.Path() == "internal/reflectlite" {
+	// For some specific packages, e.g. reflect, the Go code performs casts between different sized memory footprints
+	// and leverages the fact that the pointer to the first field is the same as the pointer to the full struct in Go.
+	// These conversions are normally not allowed by GopherJS. However, in those specific packages, the original code
+	// does this kind of cast so often, that to avoid them would cause massive amounts of native overrides.
+	// To simplify the native overrides we will allow casts between specific types for specific packages by looking up
+	// the `kindType` that is assigned when creating them.
+	//
+	// Given the structure `type K struct{T; additional fields}` the untyped pointer to `K` is also the untyped pointer
+	// to the first field, i.e. `T`. An example of this is `abi.MapType` with `abi.Type` as its first field.
+	// These packages will hold onto `t *T` then cast to the kind type with `k = (*K)unsafe.Pointer(t)`.
+	// Normally this isn't allowed in JS because `K` is larger with additional fields, but when we created `t` in the
+	// native overrides, we assign `k` as the `t.kindType` then we translate those specific casts to get that `kindType`,
+	// thus greatly reducing the amount of overrides we have to add to those packages.
+	if fc.packageAllowsKindTypeConversion() {
 		if call, isCall := expr.(*ast.CallExpr); isCall && types.Identical(fc.typeOf(call.Fun), types.Typ[types.UnsafePointer]) {
 			if ptr, isPtr := desiredType.(*types.Pointer); isPtr {
 				if named, isNamed := ptr.Elem().(*types.Named); isNamed {
-					switch named.Obj().Name() {
-					case "arrayType", "chanType", "funcType", "interfaceType", "mapType", "ptrType", "sliceType", "structType":
-						return fc.formatExpr("%e.kindType", call.Args[0]) // unsafe conversion
-					default:
-						return fc.translateExpr(expr)
+					switch named.Obj().Pkg().Path() {
+					case `internal/abi`:
+						switch named.Obj().Name() {
+						case `ArrayType`, `ChanType`, `FuncType`, `InterfaceType`, `MapType`, `PtrType`, `SliceType`, `StructType`:
+							return fc.formatExpr("%e.kindType", call.Args[0]) // unsafe conversion
+						}
+					case `reflect`:
+						switch named.Obj().Name() {
+						// The following are extensions of the ABI equivalent type to add more methods.
+						// e.g. `type structType struct { abi.StructType }`.
+						case `interfaceType`, `mapType`, `ptrType`, `sliceType`, `structType`:
+							obj := fc.pkgCtx.Pkg.Scope().Lookup(`toKindTypeExt`)
+							return fc.formatExpr("%s(%e)", fc.objectName(obj), call.Args[0]) // unsafe conversion
+						}
 					}
+					return fc.translateExpr(expr)
 				}
 			}
 		}
@@ -1261,7 +1351,7 @@ func (fc *funcContext) translateConversion(expr ast.Expr, desiredType types.Type
 		ptrVar := fc.newLocalVariable("_ptr")
 		getterConv := fc.translateConversion(fc.setType(&ast.StarExpr{X: fc.newIdent(ptrVar, exprType)}, exprTypeElem), t.Elem())
 		setterConv := fc.translateConversion(fc.newIdent("$v", t.Elem()), exprTypeElem)
-		return fc.formatExpr("(%1s = %2e, new %3s(function() { return %4s; }, function($v) { %1s.$set(%5s); }, %1s.$target))", ptrVar, expr, fc.typeName(desiredType), getterConv, setterConv)
+		return fc.formatExpr("(%1s = %2e, new %3s(function() { return %4s; }, function($v) { %1s.$set(%5s); }, %1s.$target, %1s.$index))", ptrVar, expr, fc.typeName(desiredType), getterConv, setterConv)
 
 	case *types.Interface:
 		if types.Identical(exprType, types.Typ[types.UnsafePointer]) {
@@ -1296,7 +1386,7 @@ func (fc *funcContext) translateImplicitConversion(expr ast.Expr, desiredType ty
 		return fc.formatExpr("%e", fc.zeroValue(desiredType))
 	}
 
-	switch desiredType.Underlying().(type) {
+	switch dt := desiredType.Underlying().(type) {
 	case *types.Slice:
 		return fc.formatExpr("$convertSliceType(%1e, %2s)", expr, fc.typeName(desiredType))
 
@@ -1310,6 +1400,18 @@ func (fc *funcContext) translateImplicitConversion(expr ast.Expr, desiredType ty
 		}
 		if _, isStruct := exprType.Underlying().(*types.Struct); isStruct {
 			return fc.formatExpr("new %1e.constructor.elem(%1e)", expr)
+		}
+
+	case *types.Pointer:
+		// Implicit conversion between named pointer-to-struct types or between
+		// one named pointer-to-struct type and an unnamed pointer-to-struct type
+		// needs the same proxy/unwrap that explicit conversions get so that
+		// the JS object has the methods for the type assigned to it and
+		// not just the JS prototype. See tests/testdata/proxyMethod/main.go
+		if _, isStruct := dt.Elem().Underlying().(*types.Struct); isStruct {
+			if sPtr, ok := exprType.Underlying().(*types.Pointer); ok && types.Identical(sPtr.Elem(), dt.Elem()) {
+				return fc.formatExpr("$pointerOfStructConversion(%e, %s)", expr, fc.typeName(desiredType))
+			}
 		}
 	}
 
