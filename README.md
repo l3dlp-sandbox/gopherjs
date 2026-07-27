@@ -15,6 +15,8 @@ GopherJS compiles Go code ([go.dev](https://go.dev/)) to pure JavaScript code. I
 
 ### What's new?
 
+- 2026-06-26: Go 1.21 support is [released](https://github.com/gopherjs/gopherjs/releases/tag/v1.21.0)!
+- 2026-01-02: Go 1.20 support is [released](https://github.com/gopherjs/gopherjs/releases/tag/v1.20.0)!
 - 2025-08-19: Go 1.19 beta2 is [released](https://github.com/gopherjs/gopherjs/releases/tag/v1.19.0-beta2), with full generics support!
 - 2024-02-24: Go 1.19 support is [available](https://github.com/gopherjs/gopherjs/releases/tag/v1.19.0-beta1)!
 - 2022-08-18: Go 1.18 support is [available](https://github.com/gopherjs/gopherjs/releases/tag/v1.18.0-beta2%2Bgo1.18.5)!
@@ -38,13 +40,13 @@ version, you can use an [older GopherJS release](https://github.com/gopherjs/gop
 
 Install GopherJS with `go install`:
 
-```
+```bash
 go install github.com/gopherjs/gopherjs@v1.21.0  # Or replace 'v1.21.0' with another version.
 ```
 
 If your local Go distribution as reported by `go version` is newer than Go 1.21, then you need to set the `GOPHERJS_GOROOT` environment variable to a directory that contains a Go 1.21 distribution. For example:
 
-```
+```bash
 go install golang.org/dl/go1.21.13@latest
 go1.21.13 download
 export GOPHERJS_GOROOT="$(go1.21.13 env GOROOT)"  # Also add this line to your .profile or equivalent.
@@ -55,6 +57,22 @@ Now you can use `gopherjs build [package]`, `gopherjs build [files]` or `gopherj
 `gopherjs` uses your platform's default `GOOS` value when generating code. Supported `GOOS` values are: `linux`, `darwin`. If you're on a different platform (e.g., Windows or FreeBSD), you'll need to set the `GOOS` environment variable to a supported value. For example, `GOOS=linux gopherjs build [package]`.
 
 _Note: GopherJS will try to write compiled object files of the core packages to your $GOROOT/pkg directory. If that fails, it will fall back to $GOPATH/pkg._
+
+#### Mac LC_UUID Error
+
+On Macs, if you compile the `gopherjs` app with anything less than go1.24, you may get the following error:
+
+```plain
+dyld[60166]: missing LC_UUID load command in ...
+```
+
+This is a Go + Mac issued [fixed in go1.24](https://tip.golang.org/doc/go1.24#linker).
+This is only an issue because gopherjs hasn't reached go1.24 support yet.
+
+If you get this error, build the `gopherjs` app with go1.24+. However, because of how
+we target specific STL versions, you must still use the correct STL for the version
+of gopherjs that you have. See how to set `GOPHERJS_GOROOT` above for how to select
+the correct STL that gopherjs will use.
 
 #### gopherjs run, gopherjs test
 
@@ -70,7 +88,7 @@ For example, navigating to `http://localhost:8080/example.com/user/project/` sho
 
 Refreshing in the browser will rebuild the served files if needed. Compilation errors will be displayed in terminal, and in browser console. Additionally, it will serve $GOROOT and $GOPATH for sourcemaps.
 
-If you include an argument, it will be the root from which everything is served. For example, if you run `gopherjs serve github.com/user/project` then the generated JavaScript for the package github.com/user/project/mypkg will be served at http://localhost:8080/mypkg/mypkg.js.
+If you include an argument, it will be the root from which everything is served. For example, if you run `gopherjs serve github.com/user/project` then the generated JavaScript for the package github.com/user/project/mypkg will be served at <http://localhost:8080/mypkg/mypkg.js>.
 
 #### Environment Variables
 
@@ -85,7 +103,7 @@ There are some GopherJS-specific environment variables:
 ### Performance Tips
 
 - Use the `-m` command line flag to generate minified code.
-- Apply gzip compression (https://en.wikipedia.org/wiki/HTTP_compression).
+- Apply gzip compression (<https://en.wikipedia.org/wiki/HTTP_compression>).
 - Use `int` instead of `(u)int8/16/32/64`.
 - Use `float64` instead of `float32`.
 
